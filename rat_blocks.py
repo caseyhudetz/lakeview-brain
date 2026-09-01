@@ -232,13 +232,55 @@ def matrix(df, months):
 
 
 def scores(m):
+    """Volume- AND seasonality-adjusted spread score.
+
+    Raw persistence is bounded by volume, so it tracks total almost by
+    construction. The fix is a null model: scatter a block's OWN n complaints
+    across the months at random and ask how many distinct months it would
+    land in.
+
+    A UNIFORM null (every month equally likely) is not good enough here --
+    rodent complaints are strongly seasonal neighborhood-wide, so every block
+    looks clumped against it and the score just re-measures seasonality.
+    So each month j gets the neighborhood's own share p_j of complaints, and
+    the null asks whether a block is clumped beyond the common seasonal
+    pattern.
+
+    With K = number of occupied months and q_j = (1 - p_j)^n:
+        E[K]   = sum_j (1 - q_j)
+        Var[K] = sum_j q_j(1 - q_j)
+                 + 2 sum_{j<k} [ (1 - p_j - p_k)^n - q_j q_k ]
+
+    z = (observed - E[K]) / sd. Positive => spread across more distinct months
+    than its volume and the season predict (a chronic, structural block).
+    Negative => concentrated into fewer months (episodic). One axis, both ends.
+    """
+    M = m.shape[1]
     total = m.sum(axis=1)
+    occupied = (m > 0).sum(axis=1)
+
+    colsum = m.sum(axis=0).to_numpy(dtype=float)
+    p = colsum / colsum.sum() if colsum.sum() > 0 else np.full(M, 1.0 / M)
+    pair = np.clip(1.0 - p[:, None] - p[None, :], 0.0, 1.0)
+    off = ~np.eye(M, dtype=bool)
+
+    ek, sd = np.empty(len(m)), np.empty(len(m))
+    for i, n in enumerate(total.to_numpy(dtype=float)):
+        q = np.power(1.0 - p, n)
+        ek[i] = float((1.0 - q).sum())
+        cov = np.power(pair, n) - np.outer(q, q)
+        var = float((q * (1.0 - q)).sum() + cov[off].sum())
+        sd[i] = np.sqrt(max(var, 1e-12))
+
     return pd.DataFrame({
         "total": total,
-        "persistence": (m > 0).sum(axis=1) / m.shape[1],
+        "persistence": occupied / M,
         "spikiness": m.max(axis=1) / total.replace(0, np.nan),
         "peak_month": m.idxmax(axis=1).astype(str),
-    })
+        "months": occupied,
+        "expected_months": ek,
+        "spread_z": (occupied.to_numpy() - ek) / sd,
+    }, index=m.index)
 
 
 def spearman(a, b):
@@ -258,21 +300,39 @@ def report(label, m, s, min_total=20):
     spik = (s[s["total"] >= min_total]
             .sort_values(["spikiness", "total"], ascending=False).head(TOP_N_LIST))
 
-    print(f"\n{'PERSISTENCE (share of months w/ >=1)':<44}   {'SPIKINESS (biggest month / total)':<44}")
-    print(f"{'#':<3}{'block':<26}{'mo%':>6}{'tot':>6}   {'#':<3}{'block':<26}{'max%':>6}{'tot':>6}")
-    print("-" * 94)
+    print(f"\n{'PERSISTENCE (share of months w/ >=1)':<50}   {'SPIKINESS (biggest month / total)':<44}")
+    print(f"{'#':<3}{'block':<26}{'mo%':>6}{'tot':>6}{'z':>6}   {'#':<3}{'block':<26}{'max%':>6}{'tot':>6}")
+    print("-" * 100)
     for i in range(TOP_N_LIST):
-        L = R = " " * 41
+        L = R = " " * 47
         if i < len(pers):
             r = pers.iloc[i]
-            L = f"{i+1:<3}{pers.index[i][:25]:<26}{r['persistence']:>5.0%}{int(r['total']):>6}"
+            L = (f"{i+1:<3}{pers.index[i][:25]:<26}{r['persistence']:>5.0%}"
+                 f"{int(r['total']):>6}{r['spread_z']:>+6.1f}")
         if i < len(spik):
             r = spik.iloc[i]
             R = f"{i+1:<3}{spik.index[i][:25]:<26}{r['spikiness']:>5.0%}{int(r['total']):>6}"
         print(f"{L}   {R}")
+    print("  z = spread vs. expected for that block's own volume and the season."
+          "\n      |z| < 2 means the timing is unremarkable; the block is just big.")
+
+    sub = s[s["total"] >= min_total]
+    adj = sub.sort_values("spread_z", ascending=False)
+    print(f"\n  VOLUME-ADJUSTED SPREAD  (observed months vs. expected for that "
+          f"block's own count, >= {min_total} complaints)")
+    print(f"  {'#':<3}{'block':<26}{'z':>7}{'mo':>5}{'exp':>6}{'tot':>6}   most CLUMPED (other end)")
+    print("  " + "-" * 92)
+    low = adj.iloc[::-1]
+    for i in range(min(TOP_N_LIST, len(adj))):
+        a = adj.iloc[i]
+        line = (f"  {i+1:<3}{adj.index[i][:25]:<26}{a['spread_z']:>+7.1f}"
+                f"{int(a['months']):>5}{a['expected_months']:>6.1f}{int(a['total']):>6}")
+        if i < 5 and i < len(low):
+            b = low.iloc[i]
+            line += f"   {low.index[i][:22]:<23}{b['spread_z']:>+5.1f} ({int(b['total'])})"
+        print(line)
 
     print("\n  -- are these just volume in disguise? --")
-    sub = s[s["total"] >= min_total]
     print(f"  (restricted to the {len(sub)} blocks with >= {min_total} complaints)")
     print(f"  spearman(persistence, total) = {spearman(sub['persistence'], sub['total']):+.2f}"
           "   (near +1.0 => persistence is a volume proxy)")
@@ -280,6 +340,8 @@ def report(label, m, s, min_total=20):
           "   (near -1.0 => spikiness is just 'low volume')")
     print(f"  spearman(persistence, spikiness) = "
           f"{spearman(sub['persistence'], sub['spikiness']):+.2f}")
+    print(f"  spearman(spread_z,    total) = {spearman(sub['spread_z'], sub['total']):+.2f}"
+          "   <- the adjusted metric; near 0 => volume divided out")
     overlap = set(pers.index) & set(spik.index)
     print(f"  blocks in BOTH top-{TOP_N_LIST} lists: {len(overlap)}"
           + (f"  {sorted(overlap)}" if overlap else "  (fully disjoint)"))
