@@ -16,7 +16,9 @@ Usage:
 """
 import argparse
 import json
+import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -29,7 +31,7 @@ import pandas as pd
 DATASET = "v6vf-nfxy"          # 311 Service Requests, Dec 2018 onward
 BASE = f"https://data.cityofchicago.org/resource/{DATASET}.json"
 START = "2021-01-01"
-COMMUNITY_AREA = "6"           # Lake View
+COMMUNITY_AREA = 6             # Lake View (numeric column, do not quote)
 PAGE = 50000
 
 # ---------------------------------------------------------------------------
@@ -46,10 +48,23 @@ TOP_N_LIST = 15
 
 
 # --------------------------------------------------------------------- fetch
-def _get(url):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.load(r)
+def _get(url, tries=6):
+    """Socrata through this proxy drops connections intermittently; retry."""
+    delay = 2
+    for attempt in range(1, tries + 1):
+        try:
+            req = urllib.request.Request(
+                url, headers={"Accept": "application/json",
+                              "User-Agent": "lakeview-rat-blocks/1.0"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                return json.load(r)
+        except Exception as e:
+            if attempt == tries:
+                raise
+            print(f"    retry {attempt}/{tries - 1} after {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
 
 
 def soql(**params):
@@ -67,17 +82,24 @@ def rodent_types():
     print("=" * 72)
     print("STEP 1a  sr_type values matching rodent/rat (citywide, since " + START + ")")
     print("=" * 72)
+    # '%RAT%' also matches "inaccuRATe". Require RODENT or RAT as a whole word.
+    keep = []
     for r in rows:
-        print(f"  {int(r['n']):>9,}  {r['sr_type']}")
-    if not rows:
+        toks = set(re.split(r"[^A-Z]+", r["sr_type"].upper()))
+        hit = bool(toks & {"RODENT", "RAT", "RATS"})
+        if hit:
+            keep.append(r["sr_type"])
+        flag = "keep" if hit else "DROP (substring match)"
+        print(f"  {int(r['n']):>9,}  {r['sr_type']:<44} {flag}")
+    if not keep:
         sys.exit("  none matched -- the type name changed, widen the LIKE")
-    return [r["sr_type"] for r in rows]
+    return keep
 
 
 def fetch_all(types):
     clause = " OR ".join("sr_type = '%s'" % t.replace("'", "''") for t in types)
     where = (f"created_date >= '{START}T00:00:00' AND "
-             f"community_area = '{COMMUNITY_AREA}' AND ({clause})")
+             f"community_area = {COMMUNITY_AREA} AND ({clause})")
     frames, offset = [], 0
     while True:
         chunk = soql(where=where, limit=PAGE, offset=offset)
@@ -227,13 +249,14 @@ def spearman(a, b):
     return float(a.corr(b))
 
 
-def report(label, m, s):
+def report(label, m, s, min_total=20):
     print("\n" + "=" * 72)
     print(f"STEP 5  {label}   ({m.shape[0]:,} blocks x {m.shape[1]} months, "
           f"{int(m.values.sum()):,} complaints)")
     print("=" * 72)
     pers = s.sort_values(["persistence", "total"], ascending=False).head(TOP_N_LIST)
-    spik = s[s["total"] >= 5].sort_values(["spikiness", "total"], ascending=False).head(TOP_N_LIST)
+    spik = (s[s["total"] >= min_total]
+            .sort_values(["spikiness", "total"], ascending=False).head(TOP_N_LIST))
 
     print(f"\n{'PERSISTENCE (share of months w/ >=1)':<44}   {'SPIKINESS (biggest month / total)':<44}")
     print(f"{'#':<3}{'block':<26}{'mo%':>6}{'tot':>6}   {'#':<3}{'block':<26}{'max%':>6}{'tot':>6}")
@@ -249,7 +272,8 @@ def report(label, m, s):
         print(f"{L}   {R}")
 
     print("\n  -- are these just volume in disguise? --")
-    sub = s[s["total"] >= 5]
+    sub = s[s["total"] >= min_total]
+    print(f"  (restricted to the {len(sub)} blocks with >= {min_total} complaints)")
     print(f"  spearman(persistence, total) = {spearman(sub['persistence'], sub['total']):+.2f}"
           "   (near +1.0 => persistence is a volume proxy)")
     print(f"  spearman(spikiness,   total) = {spearman(sub['spikiness'], sub['total']):+.2f}"
@@ -311,6 +335,9 @@ def main():
     ap.add_argument("--dupes", action="store_true",
                     help="chart the duplicates-included cut (default: collapsed)")
     ap.add_argument("--out", default="rat_blocks.png")
+    ap.add_argument("--min-total", type=int, default=20,
+                    help="min complaints for a block to enter the SPIKINESS list "
+                         "(low floors just rank tiny blocks; default 20)")
     ap.add_argument("--merge-street-type", action="store_true",
                     help="fold 'N CLARK ST'/'N CLARK AVE'/'N CLARK' into one block")
     a = ap.parse_args()
@@ -367,8 +394,8 @@ def main():
     print(f"  observation window: {months[0]} .. {months[-1]}  ({len(months)} months)")
     m_all, m_col = matrix(df, months), matrix(kept, months)
     s_all, s_col = scores(m_all), scores(m_col)
-    p_all, k_all = report("DUPLICATES INCLUDED", m_all, s_all)
-    p_col, k_col = report("DUPLICATES COLLAPSED", m_col, s_col)
+    p_all, k_all = report("DUPLICATES INCLUDED", m_all, s_all, a.min_total)
+    p_col, k_col = report("DUPLICATES COLLAPSED", m_col, s_col, a.min_total)
 
     print("\n" + "=" * 72)
     print("DOES COLLAPSING DUPLICATES CHANGE THE ANSWER?")
