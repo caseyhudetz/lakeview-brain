@@ -157,7 +157,6 @@ def geo_filter(df, cols):
         return df, 0, 0
     lat = pd.to_numeric(df[lat_c], errors="coerce")
     lng = pd.to_numeric(df[lng_c], errors="coerce")
-    nogeo = int(lat.isna().sum() | 0) + 0
     nogeo = int((lat.isna() | lng.isna()).sum())
     keep = (lat.between(LAT_MIN, LAT_MAX) & lng.between(LNG_MIN, LNG_MAX))
     outside = int((~keep & ~(lat.isna() | lng.isna())).sum())
@@ -166,7 +165,9 @@ def geo_filter(df, cols):
 
 def to_blocks(df, cols):
     """Step 3: 1247 N BROADWAY -> '1200 N BROADWAY'."""
-    num = pd.to_numeric(df[cols["street number"]], errors="coerce")
+    raw = df[cols["street number"]].astype(str).str.strip()
+    # "1247-1249" / "1247 REAR" -> 1247; keep the leading number, drop the rest
+    num = pd.to_numeric(raw.str.extract(r"^(\d+)", expand=False), errors="coerce")
     ok_num = num.notna() & (num > 0)
 
     def clean(c):
@@ -201,10 +202,10 @@ def collapse(df, dup_c, par_c):
 
 
 # --------------------------------------------------------------- analysis
-def matrix(df):
+def matrix(df, months):
+    """months is pinned by the caller so every cut shares one denominator."""
     m = (df.groupby(["block", "month"]).size().unstack(fill_value=0))
-    full = pd.period_range(df["month"].min(), df["month"].max(), freq="M")
-    m = m.reindex(columns=full, fill_value=0)
+    m = m.reindex(columns=months, fill_value=0)
     return m.loc[m.sum(axis=1).sort_values(ascending=False).index]
 
 
@@ -362,7 +363,9 @@ def main():
     kept, n_dup = collapse(df, dup_c, par_c)
     print(f"  duplicates collapsed away          {n_dup:>7,}  ({n_dup / max(len(df),1):.1%})")
 
-    m_all, m_col = matrix(df), matrix(kept)
+    months = pd.period_range(df["month"].min(), df["month"].max(), freq="M")
+    print(f"  observation window: {months[0]} .. {months[-1]}  ({len(months)} months)")
+    m_all, m_col = matrix(df, months), matrix(kept, months)
     s_all, s_col = scores(m_all), scores(m_col)
     p_all, k_all = report("DUPLICATES INCLUDED", m_all, s_all)
     p_col, k_col = report("DUPLICATES COLLAPSED", m_col, s_col)
